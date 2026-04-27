@@ -49,6 +49,7 @@
 #include "storage/index/vector/vector_index_reader.h"
 #include "storage/index/vector/vector_index_reader_factory.h"
 #include "storage/index/vector/vector_search_option.h"
+#include "storage/lake/filenames.h"
 #include "storage/lake/update_manager.h"
 #include "storage/projection_iterator.h"
 #include "storage/range.h"
@@ -442,7 +443,7 @@ private:
     IndexReadOptions _index_read_options(ColumnId cid) const;
 
     Status _init_reader_from_file(const std::string& index_path, const std::shared_ptr<TabletIndex>& tablet_index_meta,
-                                  const std::map<std::string, std::string>& query_params);
+                                  const std::map<std::string, std::string>& query_params, FileSystem* fs = nullptr);
     StatusOr<size_t> _predicate_evaluate(vector<rowid_t>* rowid);
 
     StatusOr<size_t> _predicate_evaluate_without_late_materialize(vector<rowid_t>* rowid);
@@ -921,17 +922,24 @@ Status SegmentIterator::_init_internal() {
 
 inline Status SegmentIterator::_init_reader_from_file(const std::string& index_path,
                                                       const std::shared_ptr<TabletIndex>& tablet_index_meta,
-                                                      const std::map<std::string, std::string>& query_params) {
+                                                      const std::map<std::string, std::string>& query_params,
+                                                      FileSystem* fs) {
 #ifdef WITH_TENANN
     if (!_vector_index_ctx) {
         return Status::OK();
     }
     ASSIGN_OR_RETURN(auto meta, get_vector_meta(tablet_index_meta, query_params))
     _vector_index_ctx->index_meta = std::make_shared<tenann::IndexMeta>(std::move(meta));
-    RETURN_IF_ERROR(VectorIndexReaderFactory::create_from_file(index_path, _vector_index_ctx->index_meta,
-                                                               &_vector_index_ctx->ann_reader));
-    auto status = _vector_index_ctx->ann_reader->init_searcher(*_vector_index_ctx->index_meta.get(), index_path);
-    // means empty ann reader
+    auto create_st = VectorIndexReaderFactory::create_from_file(index_path, _vector_index_ctx->index_meta,
+                                                                &_vector_index_ctx->ann_reader, fs);
+    // .vi file not found — fallback to brute-force scan
+    if (create_st.is_not_found()) {
+        _vector_index_ctx->use_vector_index = false;
+        return Status::OK();
+    }
+    RETURN_IF_ERROR(create_st);
+    auto status = _vector_index_ctx->ann_reader->init_searcher(*_vector_index_ctx->index_meta.get(), index_path, fs);
+    // means empty ann reader — fallback to brute-force scan
     if (status.is_not_supported()) {
         _vector_index_ctx->use_vector_index = false;
         return Status::OK();
@@ -970,10 +978,17 @@ Status SegmentIterator::_init_ann_reader() {
 
     auto tablet_index_meta = std::make_shared<TabletIndex>(hit_indexes[0]);
 
-    std::string index_path = IndexDescriptor::vector_index_file_path(_opts.rowset_path, _opts.rowsetid.to_string(),
-                                                                     segment_id(), tablet_index_meta->index_id());
+    std::string index_path;
+    if (_opts.belonged_to_cloud_native) {
+        index_path =
+                lake::gen_vector_index_path_from_segment_path(_segment->file_name(), tablet_index_meta->index_id());
+    } else {
+        index_path = IndexDescriptor::vector_index_file_path(_opts.rowset_path, _opts.rowsetid.to_string(),
+                                                             segment_id(), tablet_index_meta->index_id());
+    }
 
-    return _init_reader_from_file(index_path, tablet_index_meta, _vector_index_ctx->query_params);
+    FileSystem* vi_fs = _opts.belonged_to_cloud_native ? _segment->file_system() : nullptr;
+    return _init_reader_from_file(index_path, tablet_index_meta, _vector_index_ctx->query_params, vi_fs);
 #else
     return Status::OK();
 #endif
